@@ -1,18 +1,34 @@
+
 package com.mypaymentspeaker
 
 import android.app.Notification
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.speech.tts.TextToSpeech
+import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.regex.Pattern
 
-class PaymentNotificationListener : NotificationListenerService(), TextToSpeech.OnInitListener {
+class PaymentNotificationListener :
+    NotificationListenerService(),
+    TextToSpeech.OnInitListener {
 
     private var tts: TextToSpeech? = null
-    @Volatile private var ready = false
+
+    @Volatile
+    private var ready = false
+
     private val seen = ConcurrentHashMap.newKeySet<String>()
+
+    private data class SpeechItem(
+        val text: String,
+        val language: Int,
+        val key: String
+    )
+
+    private val speechQueue = ArrayDeque<SpeechItem>()
+    private val queueLock = Any()
 
     private val paymentPackages = mapOf(
         "com.google.android.apps.nbu.paisa.user" to "Google Pay",
@@ -27,18 +43,31 @@ class PaymentNotificationListener : NotificationListenerService(), TextToSpeech.
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
+
         val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+
         if (!prefs.getBoolean("enabled", true)) return
 
         val appName = paymentPackages[sbn.packageName] ?: return
-        val n = sbn.notification ?: return
-        val extras = n.extras ?: return
+        val notification = sbn.notification ?: return
+        val extras = notification.extras ?: return
 
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-        val bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString().orEmpty()
-        val lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
-            ?.joinToString(" · ") { it.toString() }.orEmpty()
+        val title = extras
+            .getCharSequence(Notification.EXTRA_TITLE)
+            ?.toString().orEmpty()
+
+        val text = extras
+            .getCharSequence(Notification.EXTRA_TEXT)
+            ?.toString().orEmpty()
+
+        val bigText = extras
+            .getCharSequence(Notification.EXTRA_BIG_TEXT)
+            ?.toString().orEmpty()
+
+        val lines = extras
+            .getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+            ?.joinToString(" · ") { it.toString() }
+            .orEmpty()
 
         val content = listOf(title, text, bigText, lines)
             .filter { it.isNotBlank() }
@@ -51,90 +80,186 @@ class PaymentNotificationListener : NotificationListenerService(), TextToSpeech.
         val event = classifyNotification(content) ?: return
         val amount = extractAmount(content) ?: return
 
-        // One spoken alert per distinct notification update.
         val key = "${sbn.packageName}:${sbn.key}:${sbn.postTime}:${content.hashCode()}"
+
         if (!seen.add(key)) return
-        if (seen.size > 500) seen.clear()
+
+        // Keep the duplicate cache bounded.
+        if (seen.size > 500) {
+            val iterator = seen.iterator()
+            repeat(100) {
+                if (iterator.hasNext()) {
+                    iterator.next()
+                    iterator.remove()
+                }
+            }
+        }
 
         val language = prefs.getInt("language", 1)
-        val mode = prefs.getInt("voice_mode", 1) // 0=Short, 1=Normal, 2=Detailed
+        val mode = prefs.getInt("voice_mode", 1)
+
         val sender = extractSender(content)
         val time = extractTime(content)
         val transactionId = extractTransactionId(content)
 
-        val spoken = buildAnnouncement(appName, event, amount, sender, time, transactionId, language, mode)
+        val spoken = buildAnnouncement(
+            appName,
+            event,
+            amount,
+            sender,
+            time,
+            transactionId,
+            language,
+            mode
+        )
 
-        if (ready) {
-            tts?.speak(spoken, TextToSpeech.QUEUE_ADD, null, key)
+        // Queue the alert even if TTS is not ready yet.
+        synchronized(queueLock) {
+            if (speechQueue.size >= 20) {
+                speechQueue.removeFirst()
+            }
+
+            speechQueue.addLast(
+                SpeechItem(spoken, language, key)
+            )
         }
+
+        processSpeechQueue()
     }
 
-    private enum class Event { RECEIVED, REFUND, FAILED }
+    private enum class Event {
+        RECEIVED,
+        REFUND,
+        FAILED
+    }
 
     private fun classifyNotification(content: String): Event? {
+
         val s = content.lowercase(Locale.ROOT)
 
         val failedWords = listOf(
-            "payment failed", "transaction failed", "failed transaction",
-            "भुगतान विफल", "पेमेंट फेल", "ବିଫଳ", "ପେମେଣ୍ଟ ଫେଲ"
+            "payment failed",
+            "transaction failed",
+            "failed transaction",
+            "भुगतान विफल",
+            "पेमेंट फेल",
+            "ବିଫଳ",
+            "ପେମେଣ୍ଟ ଫେଲ"
         )
+
         val refundWords = listOf(
-            "refund", "refunded", "refund processed", "रिफंड", "वापस",
-            "ରିଫଣ୍ଡ", "ଫେରସ୍ତ"
+            "refund",
+            "refunded",
+            "refund processed",
+            "रिफंड",
+            "वापस",
+            "ରିଫଣ୍ଡ",
+            "ଫେରସ୍ତ"
         )
+
         val receivedWords = listOf(
-            "received", "credited", "payment successful", "money received",
-            "paid you", "sent you", "has sent", "have sent",
-            "completed transaction update", "completed transaction updates",
-            "ପାଇଛନ୍ତି", "ଜମା", "ପ୍ରାପ୍ତ", "ମିଳିଛି",
-            "मिले", "प्राप्त", "जमा", "आपको भेजे"
+            "received",
+            "credited",
+            "payment successful",
+            "money received",
+            "paid you",
+            "sent you",
+            "has sent",
+            "have sent",
+            "completed transaction update",
+            "completed transaction updates",
+            "ପାଇଛନ୍ତି",
+            "ଜମା",
+            "ପ୍ରାପ୍ତ",
+            "ମିଳିଛି",
+            "मिले",
+            "प्राप्त",
+            "जमा",
+            "आपको भेजे"
         )
 
         return when {
-            failedWords.any { s.contains(it) } -> Event.FAILED
-            refundWords.any { s.contains(it) } -> Event.REFUND
-            receivedWords.any { s.contains(it) } -> Event.RECEIVED
+            failedWords.any { s.contains(it) } ->
+                Event.FAILED
+
+            refundWords.any { s.contains(it) } ->
+                Event.REFUND
+
+            receivedWords.any { s.contains(it) } ->
+                Event.RECEIVED
+
             else -> null
         }
     }
 
     private fun extractAmount(content: String): String? {
+
         val patterns = listOf(
-            Pattern.compile("(?:₹|Rs\\.?\\s*|INR\\s*)([0-9,]+(?:\\.[0-9]{1,2})?)", Pattern.CASE_INSENSITIVE),
-            Pattern.compile("([0-9,]+(?:\\.[0-9]{1,2})?)\\s*(?:rupees|rs\\.?|ଟଙ୍କା|रुपये)", Pattern.CASE_INSENSITIVE)
+            Pattern.compile(
+                "(?:₹|Rs\\.?\\s*|INR\\s*)([0-9,]+(?:\\.[0-9]{1,2})?)",
+                Pattern.CASE_INSENSITIVE
+            ),
+            Pattern.compile(
+                "([0-9,]+(?:\\.[0-9]{1,2})?)\\s*(?:rupees|rs\\.?|ଟଙ୍କା|रुपये)",
+                Pattern.CASE_INSENSITIVE
+            )
         )
+
         for (pattern in patterns) {
             val matcher = pattern.matcher(content)
-            if (matcher.find()) return matcher.group(1)?.replace(",", "")
+
+            if (matcher.find()) {
+                return matcher.group(1)?.replace(",", "")
+            }
         }
+
         return null
     }
 
     private fun extractSender(content: String): String? {
-        // PhonePe format example: "Akshaya Kumar Naik has sent ₹1 to your bank account..."
+
         val phonePe = Regex(
             "(?:^|[·•])\\s*([A-Za-z][A-Za-z .'-]{1,40}?)\\s+has sent\\b",
             RegexOption.IGNORE_CASE
         ).find(content)
+
         if (phonePe != null) {
-            return phonePe.groupValues[1].trim().trim('.', ',', ':', '-', ' ')
+            return phonePe.groupValues[1]
+                .trim()
+                .trim('.', ',', ':', '-', ' ')
         }
 
         val patterns = listOf(
-            Regex("(?:from|by|\\bसे|द्वारा|ଙ୍କଠାରୁ)\\s+([A-Za-z][A-Za-z .'-]{1,35})", RegexOption.IGNORE_CASE),
-            Regex("([A-Za-z][A-Za-z .'-]{1,35})\\s+(?:sent you|paid you)", RegexOption.IGNORE_CASE)
+            Regex(
+                "(?:from|by|\\bसे|द्वारा|ଙ୍କଠାରୁ)\\s+([A-Za-z][A-Za-z .'-]{1,35})",
+                RegexOption.IGNORE_CASE
+            ),
+            Regex(
+                "([A-Za-z][A-Za-z .'-]{1,35})\\s+(?:sent you|paid you)",
+                RegexOption.IGNORE_CASE
+            )
         )
+
         for (pattern in patterns) {
             val match = pattern.find(content)
-            val candidate = match?.groupValues?.getOrNull(1)?.trim()?.trim('.', ',', ':', '-', ' ')
+
+            val candidate = match
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.trim()
+                ?.trim('.', ',', ':', '-', ' ')
+
             if (!candidate.isNullOrBlank()) return candidate
         }
+
         return null
     }
 
     private fun extractTime(content: String): String? {
-        return Regex("\\b(?:at\\s*)?([0-1]?[0-9]):[0-5][0-9]\\s*(?:AM|PM)?\\b", RegexOption.IGNORE_CASE)
-            .find(content)?.value?.trim()
+        return Regex(
+            "\\b(?:at\\s*)?([0-1]?[0-9]):[0-5][0-9]\\s*(?:AM|PM)?\\b",
+            RegexOption.IGNORE_CASE
+        ).find(content)?.value?.trim()
     }
 
     private fun extractTransactionId(content: String): String? {
@@ -154,63 +279,146 @@ class PaymentNotificationListener : NotificationListenerService(), TextToSpeech.
         language: Int,
         mode: Int
     ): String {
+
         val detailed = mode == 2
         val normal = mode == 1
+
         return when (language) {
+
             0 -> when (event) {
+
                 Event.RECEIVED -> buildString {
                     append("$appName ରେ $amount ଟଙ୍କା ପେମେଣ୍ଟ ଆସିଛି।")
-                    if ((normal || detailed) && sender != null) append(" $sender ଙ୍କଠାରୁ।")
-                    if (detailed && time != null) append(" ସମୟ $time।")
-                    if (detailed && transactionId != null) append(" ଟ୍ରାଞ୍ଜାକ୍ସନ ଆଇଡି $transactionId।")
+
+                    if ((normal || detailed) && sender != null) {
+                        append(" $sender ଙ୍କଠାରୁ।")
+                    }
+
+                    if (detailed && time != null) {
+                        append(" ସମୟ $time।")
+                    }
+
+                    if (detailed && transactionId != null) {
+                        append(" ଟ୍ରାଞ୍ଜାକ୍ସନ ଆଇଡି $transactionId।")
+                    }
                 }
-                Event.REFUND -> "$appName ରେ $amount ଟଙ୍କା ରିଫଣ୍ଡ ନୋଟିଫିକେସନ ଆସିଛି।"
-                Event.FAILED -> "$appName ରେ $amount ଟଙ୍କା ପେମେଣ୍ଟ ବିଫଳ ହୋଇଛି।"
+
+                Event.REFUND ->
+                    "$appName ରେ $amount ଟଙ୍କା ରିଫଣ୍ଡ ନୋଟିଫିକେସନ ଆସିଛି।"
+
+                Event.FAILED ->
+                    "$appName ରେ $amount ଟଙ୍କା ପେମେଣ୍ଟ ବିଫଳ ହୋଇଛି।"
             }
+
             2 -> when (event) {
+
                 Event.RECEIVED -> buildString {
                     append("$appName. $amount rupees received.")
-                    if ((normal || detailed) && sender != null) append(" From $sender.")
-                    if (detailed && time != null) append(" Time $time.")
-                    if (detailed && transactionId != null) append(" Transaction ID $transactionId.")
+
+                    if ((normal || detailed) && sender != null) {
+                        append(" From $sender.")
+                    }
+
+                    if (detailed && time != null) {
+                        append(" Time $time.")
+                    }
+
+                    if (detailed && transactionId != null) {
+                        append(" Transaction ID $transactionId.")
+                    }
                 }
-                Event.REFUND -> "$appName. Refund notification for $amount rupees."
-                Event.FAILED -> "$appName. Payment of $amount rupees failed."
+
+                Event.REFUND ->
+                    "$appName. Refund notification for $amount rupees."
+
+                Event.FAILED ->
+                    "$appName. Payment of $amount rupees failed."
             }
+
             else -> when (event) {
+
                 Event.RECEIVED -> buildString {
                     append("$appName में $amount रुपये प्राप्त हुए हैं।")
-                    if ((normal || detailed) && sender != null) append(" $sender से।")
-                    if (detailed && time != null) append(" समय $time।")
-                    if (detailed && transactionId != null) append(" ट्रांजैक्शन आईडी $transactionId।")
+
+                    if ((normal || detailed) && sender != null) {
+                        append(" $sender से।")
+                    }
+
+                    if (detailed && time != null) {
+                        append(" समय $time।")
+                    }
+
+                    if (detailed && transactionId != null) {
+                        append(" ट्रांजैक्शन आईडी $transactionId।")
+                    }
                 }
-                Event.REFUND -> "$appName में $amount रुपये का रिफंड नोटिफिकेशन आया है।"
-                Event.FAILED -> "$appName में $amount रुपये का पेमेंट असफल हुआ है।"
+
+                Event.REFUND ->
+                    "$appName में $amount रुपये का रिफंड नोटिफिकेशन आया है।"
+
+                Event.FAILED ->
+                    "$appName में $amount रुपये का पेमेंट असफल हुआ है।"
             }
         }
     }
 
     override fun onInit(status: Int) {
+
         ready = status == TextToSpeech.SUCCESS
+
         if (ready) {
-            val language = getSharedPreferences("settings", MODE_PRIVATE).getInt("language", 1)
-            val locale = when (language) {
-                0 -> Locale("or", "IN")
-                2 -> Locale("en", "IN")
-                else -> Locale("hi", "IN")
-            }
-            val result = tts?.setLanguage(locale)
-            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                tts?.setLanguage(Locale("en", "IN"))
+            processSpeechQueue()
+        }
+    }
+
+    private fun processSpeechQueue() {
+
+        if (!ready) return
+
+        synchronized(queueLock) {
+
+            while (ready && speechQueue.isNotEmpty()) {
+
+                val item = speechQueue.removeFirst()
+
+                val locale = when (item.language) {
+                    0 -> Locale("or", "IN")
+                    2 -> Locale("en", "IN")
+                    else -> Locale("hi", "IN")
+                }
+
+                val languageResult = tts?.setLanguage(locale)
+                    ?: TextToSpeech.LANG_NOT_SUPPORTED
+
+                if (
+                    languageResult == TextToSpeech.LANG_MISSING_DATA ||
+                    languageResult == TextToSpeech.LANG_NOT_SUPPORTED
+                ) {
+                    tts?.setLanguage(Locale("en", "IN"))
+                }
+
+                tts?.speak(
+                    item.text,
+                    TextToSpeech.QUEUE_ADD,
+                    null,
+                    item.key
+                )
             }
         }
     }
 
     override fun onDestroy() {
+
+        ready = false
+
+        synchronized(queueLock) {
+            speechQueue.clear()
+        }
+
         tts?.stop()
         tts?.shutdown()
         tts = null
-        ready = false
+
         super.onDestroy()
     }
 }
